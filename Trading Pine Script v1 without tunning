@@ -1,0 +1,367 @@
+  //@version=5
+strategy(title             = "均線三刀流 · Competition Edition (Regime Score + Dynamic Slope)",shorttitle        = "3K-CRS",overlay           = true,default_qty_type  = strategy.percent_of_equity,default_qty_value = 100000,commission_type   = strategy.commission.percent,commission_value  = 0.05,slippage          = 2)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ARCHITECTURE NOTES
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  This script is designed for a 1H chart only.
+//  No MTF request.security calls. No TWPE / intra-candle prediction.
+//  All slopes are percentage-change over an N-bar lookback to avoid
+//  unit sensitivity and MA lag artifacts.
+//
+//  ENTRY GATE (all conditions must pass):
+//    ① regime_score abs > chop_threshold          → market is trending
+//    ② regime_score sign matches trade direction   → trend agrees
+//    ③ price crosses Guan Yu by distance_pct       → confirmed breakout
+//    ④ gy_slope_pct abs > dynamic_req_slope        → MA has real momentum
+//
+//  EXIT GATE (Zhang Fei):
+//    • Long:  close < ZhangFei MA  OR  ZhangFei slope % turns negative
+//    • Short: close > ZhangFei MA  OR  ZhangFei slope % turns positive
+//
+// ════════════════════════════════════════════════════════════════════════════
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  INPUT GROUP LABELS
+// ────────────────────────────────────────────────────────────────────────────
+
+G1 = "⚔️  The Three Generals (Moving Averages)"
+G2 = "🤖  AI Breakout Filter (Asset-Specific)"
+G3 = "📊  Regime & Dynamic Slope Filters"
+G4 = "🎯  Trade Direction"
+G5 = "🎨  Visuals"
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  GROUP 1 · MOVING AVERAGES
+// ────────────────────────────────────────────────────────────────────────────
+
+liubei_len   = input.int   (240,   "🟠 Liu Bei   – Length (Macro Trend MA)",  minval=1, group=G1,tooltip="Orange line. Determines the macro trend direction and feeds the Continuous Regime Score.")
+guanyu_len   = input.int   (60,    "🟢 Guan Yu   – Length (Entry Signal MA)", minval=1, group=G1,tooltip="Green line. Primary breakout trigger. Entry requires both a price distance AND a dynamic slope confirmation.")
+zhangfei_len = input.int   (20,    "🔵 Zhang Fei – Length (Exit / Profit MA)", minval=1, group=G1,tooltip="Blue line. Position closed when price crosses this line OR its slope % reverses.")
+ma_type      = input.string("EMA", "MA Type", options=["SMA","EMA","WMA","HMA","RMA"], group=G1,tooltip="Applied uniformly to all three generals.")
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  GROUP 2 · AI BREAKOUT FILTER (original logic retained)
+// ────────────────────────────────────────────────────────────────────────────
+
+distance_pct = input.float(2.0,  "Distance Filter %  (站上百分比)", minval=0.0, step=0.1, group=G2,tooltip="Price must exceed Guan Yu by this % for a confirmed breakout.\n\nPresets:\n• ETH    → 0%\n• Silver → 1.5%\n• Solana → 2%\n• BTC    → 2.5%")
+play_bounce  = input.bool (false, "Trade Counter-Trend Bounces (反彈)", group=G2,tooltip="ON → enter Long in Bearish regime (bounce), Short in Bullish regime (correction).\n\nPresets:\n• Crypto / Silver → OFF\n• Indices / Gold   → ON")
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  GROUP 3 · REGIME SCORE + DYNAMIC SLOPE  (Optuna-ready)
+// ────────────────────────────────────────────────────────────────────────────
+
+macro_lookback = input.int  (5,    "📏 Liu Bei Slope Lookback  (N bars)",      minval=1,  maxval=12,  group=G3,tooltip="N-bar lookback for Liu Bei slope %.\nslope = (LiuBei[0] - LiuBei[N]) / LiuBei[N] × 100\nSmaller = more reactive. Larger = smoother macro view.")
+
+dist_weight    = input.float(0.6,  "⚖️  Distance Weight  (slope = 1 - this)",  minval=0.0, maxval=1.0, step=0.1, group=G3,tooltip="Weight of price-distance-from-LiuBei in the raw regime score.\nSlope weight is auto-set to 1.0 minus this value.\n\n0.6 = 60% price distance, 40% MA slope.\n0.0 = pure slope signal.")
+// slope_weight is derived, not a standalone input, to keep the total weight = 1.0
+
+tanh_scale     = input.float(10.0, "🔭 Tanh Sensitivity  (raw score divisor)", minval=0.5, maxval=50.0, step=0.5, group=G3,tooltip="Divides raw_score before passing to tanh().\n\nLower = score saturates faster (more binary, near ±1 most of time).\nHigher = score stays in the middle range longer (more continuous).\n\nRule of thumb: set to roughly 2× your asset's typical distance-from-MA%.\n• BTC typical dist 5-10% → try 10-20\n• Indices typical dist 1-3% → try 3-6")
+
+chop_threshold = input.float(0.15, "🚫 Chop Threshold  (deadband ±)",          minval=0.05, maxval=0.40, step=0.05, group=G3,tooltip="If abs(regime_score) < this value, the market is ranging. All new entries are blocked.\n\n0.15 = default (conservative)\n0.25 = wider deadband (fewer but cleaner trades)")
+
+base_req_slope = input.float(0.15, "📐 Base Required Guan Yu Slope %",          minval=0.05, maxval=0.50, step=0.05, group=G3,tooltip="Minimum Guan Yu slope % required when regime_score = 1.0 (perfect trend).\ndynamic_req_slope = base_req_slope / abs(regime_score)\n\nWhen regime is weak (score ≈ 0.2), required slope rises to base/0.2 = 5×.\nWhen regime is strong (score ≈ 0.9), required slope ≈ base/0.9 ≈ base.")
+
+gy_slope_lookback = input.int(2,   "🔬 Guan Yu Slope Lookback  (N bars)",      minval=1, maxval=10, group=G3,tooltip="N-bar lookback for Guan Yu slope %.\nslope = (GuanYu[0] - GuanYu[N]) / GuanYu[N] × 100\nDefault 2 bars = very short-term momentum of the entry MA.")
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  GROUP 4 · TRADE DIRECTION
+// ────────────────────────────────────────────────────────────────────────────
+
+allow_long  = input.bool(true,  "Allow Long  Entries", group=G4)
+allow_short = input.bool(true,  "Allow Short Entries", group=G4,tooltip="Disable for spot-only accounts.")
+
+
+// ────────────────────────────────────────────────────────────────────────────
+//  GROUP 5 · VISUALS
+// ────────────────────────────────────────────────────────────────────────────
+
+show_liubei     = input.bool(true,  "Show Liu Bei   (Orange / Trend)",  group=G5)
+show_guanyu     = input.bool(true,  "Show Guan Yu   (Green  / Entry)",  group=G5)
+show_zhangfei   = input.bool(true,  "Show Zhang Fei (Blue   / Exit)",   group=G5)
+show_thresholds = input.bool(true,  "Show Buy / Sell Threshold Lines",  group=G5)
+show_signals    = input.bool(true,  "Show Entry / Exit Signals",        group=G5)
+show_bg         = input.bool(true,  "Colour Background by Regime Score",group=G5,tooltip="Opacity of the background scales with abs(regime_score) so ranging periods are visually muted.")
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MA HELPER
+// ════════════════════════════════════════════════════════════════════════════
+
+f_ma(src, len, mtype) =>
+    switch mtype
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "WMA" => ta.wma(src, len)
+        "HMA" => ta.hma(src, len)
+        "RMA" => ta.rma(src, len)
+        =>       ta.ema(src, len)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THE THREE GENERALS  (all native 1H, no MTF)
+// ════════════════════════════════════════════════════════════════════════════
+
+MA_LiuBei   = f_ma(close, liubei_len,   ma_type)   // 🟠 Macro trend
+MA_GuanYu   = f_ma(close, guanyu_len,   ma_type)   // 🟢 Entry trigger
+MA_ZhangFei = f_ma(close, zhangfei_len, ma_type)   // 🔵 Exit / profit
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CUSTOM MATH HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+// Calculates the hyperbolic tangent (tanh)
+f_tanh(x) =>
+    // Clamp the input to prevent math.exp() from overflowing on extreme numbers
+    safe_x = math.max(math.min(x, 10.0), -10.0)
+    e2x = math.exp(2.0 * safe_x)
+    (e2x - 1.0) / (e2x + 1.0)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CONTINUOUS REGIME SCORE  [-1.0, +1.0]
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  Step 1 — Price distance from Liu Bei (% above = positive, below = negative)
+//    lb_dist_pct  = (close - LiuBei) / LiuBei × 100
+//
+//  Step 2 — Liu Bei N-bar slope % (pure delta, no extra smoothing)
+//    lb_slope_pct = (LiuBei[0] - LiuBei[N]) / LiuBei[N] × 100
+//
+//  Step 3 — Weighted raw score
+//    slope_weight = 1.0 - dist_weight     (auto-derived, sums to 1)
+//    raw_score    = (lb_dist_pct × dist_weight) + (lb_slope_pct × slope_weight)
+//
+//  Step 4 — Squash to (-1, +1) via tanh
+//    regime_score = tanh(raw_score / tanh_scale)
+//
+//  WHY tanh_scale?
+//    Raw score is in % units. tanh saturates near ±1 very quickly:
+//    tanh(2) = 0.96. Without scaling, a 5% BTC distance gives
+//    raw_score ≈ 3 → regime_score ≈ 0.995 (essentially binary).
+//    tanh_scale stretches the linear zone so the score is genuinely
+//    continuous over the asset's normal operating range.
+// ════════════════════════════════════════════════════════════════════════════
+
+slope_weight = 1.0 - dist_weight   // auto-derived, not a standalone input
+
+// Guard against division by zero on very first bars before MA is populated
+lb_dist_pct  = MA_LiuBei != 0 ? (close - MA_LiuBei) / MA_LiuBei * 100.0 : 0.0
+
+// N-bar slope %: how much has LiuBei moved in the last macro_lookback bars?
+// Using [macro_lookback] safely — Pine evaluates this correctly on all bars.
+lb_slope_pct = MA_LiuBei[macro_lookback] != 0 ? (MA_LiuBei - MA_LiuBei[macro_lookback]) / MA_LiuBei[macro_lookback] * 100.0 : 0.0
+
+raw_score    = (lb_dist_pct * dist_weight) + (lb_slope_pct * slope_weight)
+
+// tanh_scale divides before squashing, widening the responsive [-1,+1] window
+regime_score = f_tanh(raw_score / tanh_scale)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  DYNAMIC ENTRY SLOPE FILTER
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  Guan Yu N-bar slope % (same no-absolute-price approach as Liu Bei)
+//    gy_slope_pct = (GuanYu[0] - GuanYu[N]) / GuanYu[N] × 100
+//
+//  Required slope scales INVERSELY with regime strength:
+//    dynamic_req_slope = base_req_slope / max(abs(regime_score), 0.01)
+//
+//  Intuition:
+//    Strong trend  (regime_score = 0.9) → req = base / 0.9 ≈ 1.1× base  (easy bar)
+//    Moderate trend(regime_score = 0.4) → req = base / 0.4 = 2.5× base  (harder)
+//    Near chop     (regime_score = 0.15)→ req = base / 0.15 ≈ 6.7× base (very hard)
+//    ...but the deadband filter already blocks entries below chop_threshold,
+//    so the near-chop extreme is a protective backstop, not a real gate.
+// ════════════════════════════════════════════════════════════════════════════
+
+gy_slope_pct    = MA_GuanYu[gy_slope_lookback] != 0 ? (MA_GuanYu - MA_GuanYu[gy_slope_lookback]) / MA_GuanYu[gy_slope_lookback] * 100.0 : 0.0
+
+dynamic_req_slope = base_req_slope / math.max(math.abs(regime_score), 0.01)
+
+slope_ok_long  = gy_slope_pct >  dynamic_req_slope   // GuanYu rising fast enough
+slope_ok_short = gy_slope_pct < -dynamic_req_slope   // GuanYu falling fast enough
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CHOP ZONE  (Deadband Filter)
+// ════════════════════════════════════════════════════════════════════════════
+
+in_chop = math.abs(regime_score) < chop_threshold   // true = block all entries
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  BREAKOUT THRESHOLDS  (original distance_pct logic, retained intact)
+// ════════════════════════════════════════════════════════════════════════════
+
+dist_ratio = distance_pct / 100.0
+thr_long   = MA_GuanYu * (1.0 + dist_ratio)   // price must close above here
+thr_short  = MA_GuanYu * (1.0 - dist_ratio)   // price must close below here
+
+above_thr_long  = close >= thr_long
+above_thr_short = close <= thr_short
+
+// Edge trigger: only fire on the FIRST bar of a new breakout
+cross_up   = above_thr_long  and not above_thr_long[1]
+cross_down = above_thr_short and not above_thr_short[1]
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ENTRY CONDITIONS
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  All four gates must pass simultaneously:
+//    ① Not in chop zone           (regime_score above deadband)
+//    ② Regime sign agrees         (positive for longs, negative for shorts)
+//    ③ Price breakout confirmed   (distance_pct cleared)
+//    ④ GuanYu slope confirmed     (dynamic_req_slope cleared)
+//
+//  Bounce / correction trades additionally require play_bounce = true
+//  and the regime to be opposite (i.e. counter-trend entries).
+// ════════════════════════════════════════════════════════════════════════════
+
+flat = strategy.position_size == 0
+
+// ── Trend-aligned entries ──────────────────────────────────────────────────
+trend_long  = not in_chop and regime_score > 0 and cross_up   and slope_ok_long  and allow_long  and flat
+trend_short = not in_chop and regime_score < 0 and cross_down and slope_ok_short and allow_short and flat
+
+// ── Counter-trend bounce entries (requires play_bounce = true) ─────────────
+bounce_long  = not in_chop and regime_score < 0 and cross_up   and slope_ok_long  and play_bounce and allow_long  and flat
+corr_short   = not in_chop and regime_score > 0 and cross_down and slope_ok_short and play_bounce and allow_short and flat
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ZHANG FEI EXIT  (slope as percentage — consistent with entry logic)
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  NOTE: Original used absolute slope difference (MA[0] - MA[1]).
+//  Converted to % for unit-consistency. Behaviour is identical but
+//  the threshold is now scale-invariant across assets and price levels.
+//
+//  slope_ZhangFei_pct > 0  → ZhangFei rising  (keep longs, exit shorts)
+//  slope_ZhangFei_pct < 0  → ZhangFei falling (exit longs, keep shorts)
+// ════════════════════════════════════════════════════════════════════════════
+
+slope_ZhangFei_pct = MA_ZhangFei[1] != 0 ? (MA_ZhangFei - MA_ZhangFei[1]) / MA_ZhangFei[1] * 100.0 : 0.0
+
+exit_long  = strategy.position_size > 0 and (close < MA_ZhangFei or slope_ZhangFei_pct < 0)
+exit_short = strategy.position_size < 0 and (close > MA_ZhangFei or slope_ZhangFei_pct > 0)
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ORDER EXECUTION
+// ════════════════════════════════════════════════════════════════════════════
+
+if trend_long
+    strategy.entry("Long",  strategy.long,  comment="Trend Long")
+if trend_short
+    strategy.entry("Short", strategy.short, comment="Trend Short")
+if bounce_long
+    strategy.entry("Long",  strategy.long,  comment="Bounce Long")
+if corr_short
+    strategy.entry("Short", strategy.short, comment="Correction Short")
+
+if exit_long
+    strategy.close("Long",  comment="ZhangFei Exit")
+if exit_short
+    strategy.close("Short", comment="ZhangFei Exit")
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PLOTS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Background: opacity scales with regime score intensity ─────────────────
+//    In a strong trend the background is vivid; near chop it fades to neutral.
+bg_intensity = math.round((1.0 - math.abs(regime_score)) * 80 + 10)   // 10 (vivid) → 90 (faint)
+bgcolor(show_bg and not in_chop and regime_score > 0 ? color.new(color.green, bg_intensity) :show_bg and not in_chop and regime_score < 0 ? color.new(color.red,   bg_intensity) :show_bg and in_chop                          ? color.new(color.gray,  92)            : na,title="Regime Background")
+
+// ── The Three Generals ─────────────────────────────────────────────────────
+plot(show_liubei   ? MA_LiuBei   : na, "Liu Bei (Orange)",  color=color.new(color.orange, 0), linewidth=2)
+plot(show_guanyu   ? MA_GuanYu   : na, "Guan Yu (Green)",   color=color.new(color.lime,   0), linewidth=2)
+plot(show_zhangfei ? MA_ZhangFei : na, "Zhang Fei (Blue)",  color=color.new(color.aqua,   0), linewidth=1)
+
+// ── Breakout threshold bands ───────────────────────────────────────────────
+plot(show_thresholds ? thr_long  : na, "Buy  Threshold", color=color.new(color.lime, 55), linewidth=1, style=plot.style_circles)
+plot(show_thresholds ? thr_short : na, "Sell Threshold", color=color.new(color.red,  55), linewidth=1, style=plot.style_circles)
+
+// ── Entry signals ──────────────────────────────────────────────────────────
+plotshape(show_signals and (trend_long  or bounce_long),title="Long  Entry", location=location.belowbar, style=shape.triangleup,size=size.small, color=color.new(color.lime, 0))
+
+plotshape(show_signals and (trend_short or corr_short),title="Short Entry", location=location.abovebar, style=shape.triangledown,size=size.small, color=color.new(color.red, 0))
+
+// ── Exit signals ───────────────────────────────────────────────────────────
+plotshape(show_signals and exit_long,title="Exit Long",  location=location.abovebar, style=shape.xcross,size=size.tiny, color=color.new(color.orange, 0))
+plotshape(show_signals and exit_short,title="Exit Short", location=location.belowbar, style=shape.xcross,size=size.tiny, color=color.new(color.orange, 0))
+
+// ── Bar colour: grey out chop bars visually ────────────────────────────────
+barcolor(in_chop ? color.new(color.gray, 60) : na, title="Chop Bar Colour")
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  INFORMATION TABLE  (top-right corner)
+// ════════════════════════════════════════════════════════════════════════════
+
+var table tbl = table.new(position.top_right, 2, 12,border_width=1, border_color=color.new(color.gray, 40),bgcolor=color.new(color.black, 72))
+
+if barstate.islast
+    // Colours
+    rs_col   = regime_score > chop_threshold  ? color.lime  : regime_score < -chop_threshold ? color.red : color.gray
+    pos_col  = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.silver
+    chop_col = in_chop ? color.red : color.lime
+    sl_col   = slope_ok_long  ? color.lime : color.gray
+    ss_col   = slope_ok_short ? color.red  : color.gray
+
+    // Text values
+    rs_txt   = str.tostring(math.round(regime_score * 1000) / 1000)
+    raw_txt  = str.tostring(math.round(raw_score * 100)    / 100) + " (÷" + str.tostring(tanh_scale) + ")"
+    pos_txt  = strategy.position_size > 0 ? "LONG  🟢" : strategy.position_size < 0 ? "SHORT 🔴" : "FLAT  ⚪"
+    chop_txt = in_chop ? "YES — BLOCKED 🚫" : "No — OK ✅"
+    drs_txt  = str.tostring(math.round(dynamic_req_slope * 1000) / 1000) + "%"
+    gys_txt  = str.tostring(math.round(gy_slope_pct      * 1000) / 1000) + "%"
+    lbs_txt  = str.tostring(math.round(lb_slope_pct      * 100)  / 100)  + "%"
+    lbd_txt  = str.tostring(math.round(lb_dist_pct       * 100)  / 100)  + "%"
+
+    // Header
+    table.cell(tbl, 0, 0, "三刀流  Competition",  text_color=color.orange, text_size=size.small, bgcolor=color.new(color.black, 50))
+    table.cell(tbl, 1, 0, ma_type + "  " + str.tostring(liubei_len) + "/" + str.tostring(guanyu_len) + "/" + str.tostring(zhangfei_len),text_color=color.orange, text_size=size.small, bgcolor=color.new(color.black, 50))
+    // Regime Score
+    table.cell(tbl, 0, 1, "Regime Score",         text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 1, rs_txt,                  text_color=rs_col,      text_size=size.small)
+    // Raw Score
+    table.cell(tbl, 0, 2, "Raw Score",             text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 2, raw_txt,                  text_color=color.white, text_size=size.small)
+    // LiuBei Distance
+    table.cell(tbl, 0, 3, "LB Dist %",             text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 3, lbd_txt,                  text_color=color.white, text_size=size.small)
+    // LiuBei Slope
+    table.cell(tbl, 0, 4, "LB Slope %",            text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 4, lbs_txt,                  text_color=color.white, text_size=size.small)
+    // Chop zone
+    table.cell(tbl, 0, 5, "In Chop?",              text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 5, chop_txt,                 text_color=chop_col,    text_size=size.small)
+    // GY slope actual
+    table.cell(tbl, 0, 6, "GY Slope %",            text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 6, gys_txt,                  text_color=color.white, text_size=size.small)
+    // GY slope required
+    table.cell(tbl, 0, 7, "Req. Slope %",          text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 7, drs_txt,                  text_color=color.white, text_size=size.small)
+    // Slope pass/fail
+    table.cell(tbl, 0, 8, "Slope Long OK",         text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 8, slope_ok_long  ? "✅" : "❌", text_color=sl_col, text_size=size.small)
+    table.cell(tbl, 0, 9, "Slope Short OK",        text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 9, slope_ok_short ? "✅" : "❌", text_color=ss_col, text_size=size.small)
+    // Position
+    table.cell(tbl, 0, 10, "Position",             text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 10, pos_txt,                 text_color=pos_col,     text_size=size.small)
+    // Distance filter
+    table.cell(tbl, 0, 11, "Dist Filter",          text_color=color.gray,  text_size=size.small)
+    table.cell(tbl, 1, 11, str.tostring(distance_pct) + "%  |  Bounces: " + (play_bounce ? "ON" : "OFF"),text_color=color.white, text_size=size.small)
